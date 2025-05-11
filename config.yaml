@@ -1,0 +1,36 @@
+# VulnScout Configuration
+
+# Worker Configuration
+workers:
+  # List of enabled workers. Can be overridden by VULNSCOUT_WORKERS env var
+  # Format: comma-separated list of worker names (e.g. "enisa,packetstorm,github,opencve")
+  enabled: "enisa"
+  
+  # Worker-specific settings
+  enisa:
+    # Maximum number of vulnerabilities to fetch (0 for unlimited)
+    max_results: 0
+
+  packetstorm:
+    # Maximum number of vulnerabilities to fetch (0 for unlimited)
+    max_results: 0
+
+  github:
+    # Maximum number of vulnerabilities to fetch (0 for unlimited)
+    max_results: 0
+
+  opencve:
+    # Maximum number of vulnerabilities to fetch (0 for unlimited)
+    max_results: 0
+
+# Cache Configuration
+cache:
+  # Cache directory
+  dir: "cache"
+  # Maximum age of cached data in seconds (default: 86400 - 24 hours)
+  max_age: 86400
+
+# Logging Configuration
+logging:
+  level: "INFO"  # Can be overridden by VULNSCOUT_LOG_LEVEL env var
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s" 
