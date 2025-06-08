@@ -1,3 +1,8 @@
+"""
+PacketStorm Security vulnerability worker.
+Uses directory-based checkpoints for intelligent incremental processing.
+"""
+
 import os
 import re
 import logging
@@ -12,13 +17,15 @@ import time
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from .base import BaseWorker
+from src.models.vulnerability import Vulnerability, VulnerabilityType
 
 logger = logging.getLogger(__name__)
+
 
 class PacketStormWorker(BaseWorker):
     """Worker for fetching exploit data from PacketStorm Security."""
     
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config):
         """Initialize the worker."""
         super().__init__(config)
         self.base_url = "http://dl.packetstormsecurity.net"
@@ -39,36 +46,10 @@ class PacketStormWorker(BaseWorker):
         
         # CVE pattern for extraction
         self.cve_pattern = re.compile(r"CVE-\d{4}-\d{4,}", re.IGNORECASE)
-        
-        # State file for tracking last update
-        self.state_file = os.path.join(self.cache_dir, "state.json")
-        self.last_update = self._load_state()
     
     @property
     def name(self) -> str:
         return "packetstorm"
-    
-    def _load_state(self) -> datetime:
-        """Load the last update time from state file."""
-        try:
-            if os.path.exists(self.state_file):
-                with open(self.state_file, 'r') as f:
-                    state = json.load(f)
-                    return datetime.fromisoformat(state.get('last_update', '2000-01-01T00:00:00'))
-        except Exception as e:
-            logger.error(f"Error loading state: {e}")
-        return datetime(2000, 1, 1)
-    
-    def _save_state(self, last_update: datetime):
-        """Save the last update time to state file."""
-        try:
-            state = {
-                'last_update': last_update.isoformat()
-            }
-            with open(self.state_file, 'w') as f:
-                json.dump(state, f)
-        except Exception as e:
-            logger.error(f"Error saving state: {e}")
     
     def _make_request(self, url: str, timeout: int = 30) -> Optional[requests.Response]:
         """Make a rate-limited request with retries."""
@@ -116,6 +97,24 @@ class PacketStormWorker(BaseWorker):
             logger.error(f"Error fetching exploit directories: {e}")
             return []
     
+    def get_unprocessed_directories(self) -> List[str]:
+        """Get directories that haven't been processed yet using checkpoint system."""
+        all_dirs = self._get_exploit_directories()
+        if not all_dirs:
+            return []
+        
+        # Get processed directory checkpoints
+        processed_dirs = set(self.get_all_checkpoints("directory"))
+        
+        # Find unprocessed directories (keep original sort order - newest first)
+        unprocessed = [d for d in all_dirs if d not in processed_dirs]
+        
+        logger.info(f"[{self.name}] Available: {len(all_dirs)}, "
+                   f"Processed: {len(processed_dirs)}, "
+                   f"Unprocessed: {len(unprocessed)}")
+        
+        return unprocessed
+    
     def _get_exploits_from_directory(self, directory_url: str) -> List[Dict[str, Any]]:
         """Fetch and parse exploits from a specific directory."""
         try:
@@ -135,11 +134,21 @@ class PacketStormWorker(BaseWorker):
             for link in soup.find_all('a'):
                 href = link.get('href')
                 if href and any(href.lower().endswith(ext) for ext in exploit_extensions):
+                    exploit_url = f"{self.base_url}/{directory_url}/{href}"
+                    exploit_id = Vulnerability.create_id(exploit_url)
+                    
+                    # Skip if already processed using ID-based checking
+                    if self.is_item_processed(exploit_id):
+                        logger.debug(f"[{self.name}] Skipping already processed: {href}")
+                        continue
+                    
                     exploits.append({
-                        'url': f"{self.base_url}/{directory_url}/{href}",
+                        'url': exploit_url,
                         'filename': href,
                         'directory': directory_url
                     })
+            
+            logger.info(f"Directory {directory_url}: processing {len(exploits)} new exploits")
             
             # Process exploits concurrently using a thread pool
             processed_exploits = []
@@ -160,6 +169,8 @@ class PacketStormWorker(BaseWorker):
                         exploit_info = future.result()
                         if exploit_info:
                             processed_exploits.append(exploit_info)
+                            # Save immediately (real-time saving)
+                            self.save_vulnerability_realtime(exploit_info)
                             logger.info(f"Progress in {directory_url}: {completed}/{total} exploits processed")
                     except Exception as e:
                         logger.error(f"Error processing exploit {exploit['url']}: {e}")
@@ -250,14 +261,6 @@ class PacketStormWorker(BaseWorker):
             else:
                 date_str = datetime.now().strftime("%Y-%m-%d")  # Fallback to today
             
-            # Determine the primary ID for the vulnerability
-            if cve_id:
-                primary_id = cve_id
-                packetstorm_id = f"PACKETSTORM-{exploit['directory']}-{exploit['filename']}"
-            else:
-                primary_id = self._generate_vrip_id()
-                packetstorm_id = None
-            
             # Create tags from the content and filename
             tags = []
             common_tags = ['overflow', 'injection', 'xss', 'csrf', 'rce', 'remote', 'local', 
@@ -280,82 +283,76 @@ class PacketStormWorker(BaseWorker):
             elif any(tag in ["xss", "csrf"] for tag in tags):
                 severity = "LOW"
             
-            # Create the vulnerability dictionary
-            return {
-                "id": primary_id,  # Primary identifier - CVE ID if available, otherwise VRIP ID
-                "cve_id": cve_id,  # This can be None if no CVE found
-                "packetstorm_id": packetstorm_id,  # PacketStorm specific ID for reference
-                "title": title,
-                "description": description,
-                "severity": severity,
-                "cvss_score": "0.0",  # PacketStorm doesn't provide CVSS
-                "cvss_vector": "",  # PacketStorm doesn't provide CVSS vector
-                "package": {
-                    "name": product if product else "Unknown",
-                    "ecosystem": "Unknown"
-                },
-                "vulnerable_version_range": "Unknown",  # PacketStorm doesn't provide version info
-                "references": [exploit['url']],
-                "published_at": date_str,
-                "updated_at": date_str,
-                "source": self.name,
-                "url": exploit['url'],
-                "tags": tags,
-                "weaknesses": [],  # PacketStorm doesn't provide CWE info
-                "exploit_content": exploit_content  # Store the full exploit content for reference
-            }
+            # Create standardized vulnerability using the model
+            vuln = Vulnerability.from_path_and_content(
+                path_url=exploit['url'],
+                content=exploit_content or content,
+                source=self.name,
+                source_id=f"PS-{exploit['directory']}-{exploit['filename']}",
+                type=VulnerabilityType.EXPLOIT,
+                cve_id=cve_id,
+                title=title,
+                description=description,
+                severity=severity,
+                published_at=date_str,
+                tags=set(tags),
+                affected_products=set([product]) if product else set()
+            )
+            
+            return vuln.to_dict()
             
         except Exception as e:
             logger.error(f"Error processing exploit {exploit['url']}: {e}")
             return None
     
     def fetch_vulnerabilities(self) -> List[Dict[str, Any]]:
-        """Fetch vulnerabilities from PacketStorm."""
+        """Fetch vulnerabilities from PacketStorm using smart directory checkpoints."""
         try:
-            logger.info("Getting all exploits from recent directories")
+            logger.info(f"[{self.name}] Starting PacketStorm vulnerability collection")
             
-            # Get exploit directories
-            directories = self._get_exploit_directories()
-            if not directories:
-                logger.error("No exploit directories found")
+            # Get unprocessed directories using checkpoint system
+            unprocessed_directories = self.get_unprocessed_directories()
+            
+            if not unprocessed_directories:
+                logger.info(f"[{self.name}] All directories already processed")
                 return []
             
-            # Process directories concurrently
+            logger.info(f"[{self.name}] Processing {len(unprocessed_directories)} unprocessed directories")
+            
+            # Process all unprocessed directories (remove artificial limits)
+            # max_dirs = self.worker_config.get('max_directories', 12)
+            # if max_dirs > 0:
+            #     unprocessed_directories = unprocessed_directories[:max_dirs]
+            #     logger.info(f"[{self.name}] Limited to {len(unprocessed_directories)} directories")
+            logger.info(f"[{self.name}] Processing ALL {len(unprocessed_directories)} unprocessed directories")
+            
+            # Process directories and collect vulnerabilities
             all_exploits = []
-            with ThreadPoolExecutor(max_workers=5) as executor:
-                # Submit all directory processing tasks
-                future_to_dir = {
-                    executor.submit(self._get_exploits_from_directory, dir_url): dir_url 
-                    for dir_url in directories
-                }
-                
-                # Process completed tasks as they finish
-                total = len(future_to_dir)
-                completed = 0
-                for future in as_completed(future_to_dir):
-                    dir_url = future_to_dir[future]
-                    completed += 1
-                    try:
-                        exploits = future.result()
-                        if exploits:
-                            all_exploits.extend(exploits)
-                        logger.info(f"Progress: {completed}/{total} directories processed")
-                    except Exception as e:
-                        logger.error(f"Error processing directory {dir_url}: {e}")
+            
+            for directory_url in unprocessed_directories:
+                try:
+                    logger.info(f"[{self.name}] Processing directory: {directory_url}")
+                    exploits = self._get_exploits_from_directory(directory_url)
+                    if exploits:
+                        all_exploits.extend(exploits)
+                    
+                    # Mark directory as processed (checkpoint)
+                    self.set_checkpoint("directory", directory_url)
+                    logger.info(f"[{self.name}] Directory checkpoint set: {directory_url}")
+                    
+                    # Respectful delay between directories
+                    time.sleep(1.0)
+                    
+                except Exception as e:
+                    logger.error(f"Error processing directory {directory_url}: {e}")
+                    continue
             
             # Sort by date (newest first)
             all_exploits.sort(key=lambda x: x.get("published_at", ""), reverse=True)
             
-            # Update last update time
-            if all_exploits:
-                latest_date = max(datetime.fromisoformat(v["published_at"]) for v in all_exploits)
-                if latest_date > self.last_update:
-                    self._save_state(latest_date)
-                    self.last_update = latest_date
-            
-            logger.info(f"Total exploits found: {len(all_exploits)}")
+            logger.info(f"[{self.name}] Total exploits collected: {len(all_exploits)}")
             return all_exploits
             
         except Exception as e:
-            logger.error(f"Error getting all exploits: {e}")
+            logger.error(f"[{self.name}] Error in vulnerability collection: {e}")
             return [] 

@@ -4,7 +4,7 @@
 workers:
   # List of enabled workers. Can be overridden by VULNSCOUT_WORKERS env var
   # Format: comma-separated list of worker names (e.g. "enisa,packetstorm,github,opencve")
-  enabled: "enisa"
+  enabled: "packetstorm"
   
   # Worker-specific settings
   enisa:
@@ -14,6 +14,8 @@ workers:
   packetstorm:
     # Maximum number of vulnerabilities to fetch (0 for unlimited)
     max_results: 0
+    # Maximum number of directories to process (0 for unlimited, 12 for last 12 months)
+    max_directories: 12
 
   github:
     # Maximum number of vulnerabilities to fetch (0 for unlimited)

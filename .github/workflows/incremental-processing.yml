@@ -1,0 +1,229 @@
+name: Incremental Vulnerability Data Processing
+
+on:
+  # Manual trigger for importing local data and continuing processing
+  workflow_dispatch:
+    inputs:
+      import_data:
+        description: 'Import preprocessed data from releases'
+        required: false
+        default: 'true'
+        type: boolean
+      workers:
+        description: 'Workers to process (comma-separated or "all")'
+        required: false
+        default: 'all'
+        type: string
+      continue_processing:
+        description: 'Continue processing after import'
+        required: false
+        default: 'true'
+        type: boolean
+      create_release:
+        description: 'Create GitHub release with results'
+        required: false
+        default: 'true'
+        type: boolean
+  
+  # Scheduled runs for lightweight updates
+  schedule:
+    # Run every 6 hours for incremental updates
+    - cron: '0 */6 * * *'
+  
+  # Trigger on new releases (when local preprocessing uploads data)
+  release:
+    types: [published, created]
+
+env:
+  VULNSCOUT_LOG_LEVEL: INFO
+  VULNSCOUT_CACHE_DIR: ./cache
+
+jobs:
+  incremental-processing:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120  # 2 hour timeout for GitHub runner efficiency
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: Create cache directory
+      run: mkdir -p cache
+    
+    - name: Download latest release data (if available)
+      if: github.event.inputs.import_data == 'true' || github.event_name == 'schedule' || github.event_name == 'release'
+      run: |
+        echo "Checking for latest release data to import..."
+        
+        # Get latest release info
+        LATEST_RELEASE=$(curl -s "https://api.github.com/repos/${{ github.repository }}/releases/latest" || echo "{}")
+        
+        if [ "$(echo $LATEST_RELEASE | jq -r '.tag_name')" != "null" ]; then
+          echo "Found latest release: $(echo $LATEST_RELEASE | jq -r '.tag_name')"
+          
+          # Download release assets (JSON files with preprocessed data)
+          mkdir -p imports
+          
+          echo $LATEST_RELEASE | jq -r '.assets[].browser_download_url' | while read url; do
+            if [[ $url == *.json ]]; then
+              filename=$(basename $url)
+              echo "Downloading $filename..."
+              curl -L -o "imports/$filename" "$url"
+            fi
+          done
+          
+          # Import data for each worker
+          for worker in packetstorm enisa github opencve; do
+            import_file="imports/${worker}_*.json"
+            if ls $import_file 1> /dev/null 2>&1; then
+              echo "Importing data for $worker..."
+              python incremental.py import --worker $worker --input-file $import_file || true
+            fi
+          done
+        else
+          echo "No release data found to import"
+        fi
+    
+    - name: Show current status
+      run: |
+        echo "Current processing status:"
+        python incremental.py status
+    
+    - name: Process workers incrementally
+      if: github.event.inputs.continue_processing == 'true' || github.event_name == 'schedule' || github.event_name == 'release'
+      run: |
+        # Determine which workers to process
+        WORKERS="${{ github.event.inputs.workers }}"
+        if [ -z "$WORKERS" ] || [ "$WORKERS" = "all" ]; then
+          WORKERS="enisa,github,opencve"  # Skip packetstorm for lightweight processing
+        fi
+        
+        echo "Processing workers: $WORKERS"
+        
+        # Process each worker with timeout protection
+        IFS=',' read -ra WORKER_ARRAY <<< "$WORKERS"
+        for worker in "${WORKER_ARRAY[@]}"; do
+          worker=$(echo $worker | xargs)  # trim whitespace
+          echo "Processing $worker..."
+          
+          # Run with timeout to avoid exceeding GitHub Actions limits
+          timeout 30m python -c "
+import sys
+sys.path.insert(0, '.')
+from src.incremental_manager import IncrementalManager
+from src.config import Config
+
+try:
+    config = Config()
+    manager = IncrementalManager(config)
+    success = manager.resume_worker('$worker')
+    print(f'Worker $worker completed: {success}')
+except Exception as e:
+    print(f'Error processing $worker: {e}')
+    # Continue with other workers even if one fails
+          " || echo "Worker $worker timed out or failed"
+          
+          # Show progress after each worker
+          python incremental.py status
+        done
+    
+    - name: Export processed data
+      run: |
+        echo "Exporting processed data..."
+        mkdir -p exports
+        python incremental.py export --worker all
+        
+        # Move exports to timestamped directory
+        timestamp=$(date +"%Y%m%d_%H%M%S")
+        mv cache/*/export.json exports/ 2>/dev/null || true
+        
+        # Create release files
+        python incremental.py release --output-dir releases
+        
+        echo "Export completed"
+    
+    - name: Show final status
+      run: |
+        echo "Final processing status:"
+        python incremental.py status
+        
+        # Show file sizes
+        echo -e "\nGenerated files:"
+        find releases -name "*.json" -exec ls -lh {} \; 2>/dev/null || echo "No release files found"
+    
+    - name: Create GitHub Release
+      if: github.event.inputs.create_release == 'true' || github.event_name == 'schedule'
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: data-${{ github.run_number }}-${{ github.run_attempt }}
+        release_name: Vulnerability Data Release ${{ github.run_number }}
+        body: |
+          Incremental vulnerability data processing results
+          
+          **Processing Summary:**
+          - Run ID: ${{ github.run_id }}
+          - Timestamp: ${{ steps.date.outputs.date }}
+          - Triggered by: ${{ github.event_name }}
+          
+          **Files included:**
+          - Processed vulnerability data in JSON format
+          - Metadata with processing statistics
+          
+          **Usage:**
+          Download the JSON files to import into your local environment:
+          ```bash
+          python incremental.py import --worker <worker_name> --input-file <downloaded_file.json>
+          ```
+        draft: false
+        prerelease: false
+    
+    - name: Upload Release Assets
+      if: github.event.inputs.create_release == 'true' || github.event_name == 'schedule'
+      run: |
+        # Get the release ID
+        RELEASE_ID=$(curl -s "https://api.github.com/repos/${{ github.repository }}/releases/tags/data-${{ github.run_number }}-${{ github.run_attempt }}" | jq -r '.id')
+        
+        if [ "$RELEASE_ID" != "null" ]; then
+          # Upload all JSON files from releases directory
+          for file in releases/*.json; do
+            if [ -f "$file" ]; then
+              filename=$(basename "$file")
+              echo "Uploading $filename..."
+              
+              curl -X POST \
+                -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+                -H "Content-Type: application/json" \
+                --data-binary @"$file" \
+                "https://uploads.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID/assets?name=$filename"
+            fi
+          done
+        fi
+    
+    - name: Cleanup
+      if: always()
+      run: |
+        # Clean up large cache files to avoid storage issues
+        find cache -name "*.db" -size +100M -delete 2>/dev/null || true
+        find cache -name "*.json" -size +50M -delete 2>/dev/null || true
+    
+    - name: Cache processing state
+      uses: actions/cache@v3
+      with:
+        path: |
+          cache
+          !cache/**/*.db
+        key: vulnscout-cache-${{ runner.os }}-${{ hashFiles('cache/**/*.json') }}
+        restore-keys: |
+          vulnscout-cache-${{ runner.os }}- 

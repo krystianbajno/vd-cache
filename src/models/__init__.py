@@ -1,5 +1,5 @@
 """Models package for vulnerability data."""
 
-from .vulnerability import Vulnerability, VulnerabilityIntelligence
+from .vulnerability import Vulnerability, VulnerabilityType
 
-__all__ = ['Vulnerability', 'VulnerabilityIntelligence'] 
+__all__ = ['Vulnerability', 'VulnerabilityType'] 

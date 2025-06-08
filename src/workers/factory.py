@@ -5,6 +5,9 @@ from .enisa import EnisaWorker
 from .packetstorm import PacketStormWorker
 from .github import GitHubAdvisoryWorker
 from .opencve import OpenCVEWorker
+from .exploitdb import ExploitDBWorker
+from .cisa_kev import CisaKevWorker
+from .nist import NistWorker
 from src.config import Config
 
 logger = logging.getLogger(__name__)
@@ -17,7 +20,10 @@ class WorkerFactory:
         "enisa": EnisaWorker,
         "packetstorm": PacketStormWorker,
         "github": GitHubAdvisoryWorker,
-        "opencve": OpenCVEWorker
+        "opencve": OpenCVEWorker,
+        "exploitdb": ExploitDBWorker,
+        "cisa_kev": CisaKevWorker,
+        "nist": NistWorker
     }
     
     @classmethod
